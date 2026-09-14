@@ -4,12 +4,10 @@ import { NumericFormat } from "react-number-format";
 import DatePicker from "react-datepicker";
 import Swal from "sweetalert2";
 import * as XLSX from "xlsx";
-
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import mammoth from "mammoth";
 import { createWorker } from "tesseract.js";
-
 import "react-datepicker/dist/react-datepicker.css";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -25,59 +23,15 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_TOTAL_SIZE = 100 * 1024 * 1024;
 
 /*
-  TESTING ONLY
-
-  Only the first 15 pages / records are analyzed.
+  TEST MODE:
+  Process only the first 15 pages.
 */
-const TEST_EXTRACT_LIMIT = 15;
+const PDF_TEST_PAGE_LIMIT = 15;
 
 /*
-  We no longer OCR the entire BIR 2307 page.
-
-  These positions correspond to the fixed BIR 2307 layout
-  you provided.
-
-  x, y, width and height are percentages of the PDF page.
-
-  Some extra margin is intentionally included because
-  scanned PDFs may be shifted slightly.
+  PDF.js scale 3 is approximately 216 DPI.
 */
-const BIR_2307_REGIONS = {
-  tin: {
-    x: 0.18,
-    y: 0.125,
-    width: 0.65,
-    height: 0.062,
-  },
-
-  name: {
-    x: 0.01,
-    y: 0.165,
-    width: 0.98,
-    height: 0.06,
-  },
-
-  paymentTable: {
-    x: 0.01,
-    y: 0.36,
-    width: 0.98,
-    height: 0.27,
-  },
-};
-
-/*
-  Render at a moderate scale.
-
-  The small cropped areas are enlarged before OCR,
-  which is faster than rendering the entire page huge.
-*/
-const PDF_RENDER_SCALE = 1.5;
-
-const REGION_UPSCALE = 2;
-
-/* =========================================================
-   FILE TYPES
-   ========================================================= */
+const PDF_OCR_SCALE = 3;
 
 const ALLOWED_EXTENSIONS = [".pdf", ".docx"];
 
@@ -105,7 +59,93 @@ const DEFAULT_VALUES = {
   grossSales: "",
   taxableIncome: "",
   taxDue: "",
-  totalAmountPayable: "",
+};
+
+/*
+  Exact BIR 2307 regions based on the first 15 pages
+  of the sample document.
+
+  All positions are ratios, not fixed pixels.
+*/
+const FORM_2307_OCR_REGIONS = {
+  period: {
+    x: 0.2,
+    y: 0.132,
+    width: 0.69,
+    height: 0.04,
+  },
+
+  /*
+    PART I
+    Taxpayer Identification Number
+  */
+  payeeTin: {
+    x: 0.28,
+    y: 0.158,
+    width: 0.51,
+    height: 0.043,
+  },
+
+  /*
+    PART I
+    Payee name
+  */
+  payeeName: {
+    x: 0.025,
+    y: 0.187,
+    width: 0.95,
+    height: 0.045,
+  },
+
+  /*
+    PART II
+    Payor / Withholding Agent TIN
+  */
+  payorTin: {
+    x: 0.28,
+    y: 0.268,
+    width: 0.51,
+    height: 0.043,
+  },
+
+  /*
+    PART II
+    Payor name
+  */
+  payorName: {
+    x: 0.025,
+    y: 0.296,
+    width: 0.95,
+    height: 0.045,
+  },
+
+  nature: {
+    x: 0.018,
+    y: 0.382,
+    width: 0.29,
+    height: 0.065,
+  },
+
+  atc: {
+    x: 0.28,
+    y: 0.388,
+    width: 0.095,
+    height: 0.05,
+  },
+
+  total: {
+    x: 0.7,
+    y: 0.388,
+    width: 0.17,
+    height: 0.05,
+  },
+
+  taxWithheld: {
+    x: 0.84,
+    y: 0.388,
+    width: 0.15,
+    height: 0.05,
+  },
 };
 
 /* =========================================================
@@ -122,43 +162,36 @@ const Toast = Swal.mixin({
 
 function openExtractionLoading(totalFiles) {
   void Swal.fire({
-    title: "Analyzing BIR 2307",
+    title: "Extracting tax records",
+
     html: `
-      <div style="padding-top:4px;text-align:center;">
+      <div style="text-align:center;">
         <div
-          id="extract-status"
+          data-extraction-status
           style="
+            margin-top:8px;
             font-size:14px;
             font-weight:600;
             color:#18181b;
           "
         >
-          Preparing document...
+          Preparing documents...
         </div>
 
         <div
-          id="extract-detail"
+          data-extraction-detail
           style="
-            margin-top:8px;
+            margin-top:7px;
             font-size:12px;
-            line-height:1.6;
+            line-height:1.5;
             color:#71717a;
           "
         >
-          Testing first ${TEST_EXTRACT_LIMIT} pages only
-        </div>
-
-        <div
-          style="
-            margin-top:12px;
-            font-size:11px;
-            color:#a1a1aa;
-          "
-        >
-          Only Payee TIN, Payee Name and Payment Table are scanned.
+          0 of ${totalFiles} files processed
         </div>
       </div>
     `,
+
     allowOutsideClick: false,
     allowEscapeKey: false,
     showConfirmButton: false,
@@ -176,9 +209,9 @@ function updateExtractionLoading(status, detail = "") {
     return;
   }
 
-  const statusElement = container.querySelector("#extract-status");
+  const statusElement = container.querySelector("[data-extraction-status]");
 
-  const detailElement = container.querySelector("#extract-detail");
+  const detailElement = container.querySelector("[data-extraction-detail]");
 
   if (statusElement) {
     statusElement.textContent = status;
@@ -218,8 +251,51 @@ function getInputClass(error) {
 }
 
 /* =========================================================
-   GENERIC HELPERS
+   GENERAL HELPERS
    ========================================================= */
+
+function cleanText(text = "") {
+  return String(text)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeText(text = "") {
+  return cleanText(text).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function cleanExtractedName(value = "") {
+  return String(value)
+    .replace(/\s+/g, " ")
+    .replace(/^[\s:;,.–—|_\-]+/, "")
+    .replace(/[\s:;,.–—|_\-]+$/, "")
+    .trim();
+}
+
+function roundAmount(value) {
+  return Math.round(Number(value) * 100) / 100;
+}
+
+function parseAmount(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const number = Number(
+    String(value)
+      .replace(/PHP/gi, "")
+      .replace(/₱/g, "")
+      .replace(/,/g, "")
+      .replace(/[^\d.-]/g, ""),
+  );
+
+  return Number.isFinite(number) ? number : null;
+}
 
 function getFileExtension(filename) {
   const index = filename.lastIndexOf(".");
@@ -262,1158 +338,37 @@ function formatFileSize(bytes) {
 }
 
 /* =========================================================
-   TEXT CLEANING
-   ========================================================= */
-
-function cleanText(text = "") {
-  return String(text)
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n[ \t]+/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function normalizeText(text = "") {
-  return cleanText(text).replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function cleanName(value = "") {
-  return String(value)
-    .replace(/\s+/g, " ")
-    .replace(/^[\s:;,.–—-]+/, "")
-    .replace(/[\s:;,.–—-]+$/, "")
-    .trim();
-}
-
-/* =========================================================
-   TIN
+   TIN HELPERS
    ========================================================= */
 
 function formatTin(value = "") {
   const digits = String(value).replace(/\D/g, "").slice(0, 14);
 
-  if (digits.length <= 3) {
-    return digits;
-  }
+  const groups = [
+    digits.slice(0, 3),
+    digits.slice(3, 6),
+    digits.slice(6, 9),
+    digits.slice(9, 14),
+  ].filter(Boolean);
 
-  if (digits.length <= 6) {
-    return `${digits.slice(0, 3)}-${digits.slice(3)}`;
-  }
-
-  if (digits.length <= 9) {
-    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`;
-  }
-
-  return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(
-    6,
-    9,
-  )}-${digits.slice(9)}`;
+  return groups.join("-");
 }
 
 function validateTin(value) {
   const length = String(value).replace(/\D/g, "").length;
 
-  if (length === 9 || length === 12 || length === 14) {
+  if ([9, 12, 14].includes(length)) {
     return true;
   }
 
   return "TIN must contain 9, 12, or 14 digits.";
 }
 
-/*
-  Specifically designed for the BIR 2307 TIN row.
+function isValidExtractedTin(value) {
+  const length = String(value || "").replace(/\D/g, "").length;
 
-  Supports:
-
-  297 - 944 - 186 - 00000
-  297-944-186-00000
-  297 944 186 00000
-  29794418600000
-*/
-function parseTinFromText(text) {
-  const normalized = normalizeText(text);
-
-  const grouped = normalized.match(
-    /\b(\d{3})\s*[- ]\s*(\d{3})\s*[- ]\s*(\d{3})\s*[- ]\s*(\d{3,5})\b/,
-  );
-
-  if (grouped) {
-    return formatTin(`${grouped[1]}${grouped[2]}${grouped[3]}${grouped[4]}`);
-  }
-
-  const compact = normalized.match(/\b(\d{12,14})\b/);
-
-  if (compact?.[1]) {
-    return formatTin(compact[1]);
-  }
-
-  /*
-    OCR fallback.
-
-    Ignore single digit row labels such as "2".
-  */
-  const numericParts =
-    normalized.match(/\d+/g)?.filter((part) => part.length >= 2) || [];
-
-  for (let index = 0; index < numericParts.length; index += 1) {
-    const candidate = numericParts.slice(index, index + 4).join("");
-
-    if (candidate.length === 12 || candidate.length === 14) {
-      return formatTin(candidate);
-    }
-  }
-
-  return "";
+  return [9, 12, 14].includes(length);
 }
-
-/* =========================================================
-   PAYEE NAME
-   ========================================================= */
-
-function parsePayeeNameFromText(text) {
-  const raw = cleanText(text);
-
-  if (!raw) {
-    return "";
-  }
-
-  /*
-    First try a direct labeled extraction.
-  */
-  const normalized = normalizeText(raw);
-
-  const directPatterns = [
-    /Payee(?:'s|’s)?\s+Name(?:\s*\([^)]*\))?\s*[:\-]?\s*([A-Z][A-Z ,.'&’/-]{4,120}?)(?=\s+(?:Registered|Address|TIN|Taxpayer|Foreign)\b|$)/i,
-
-    /Payee\s+Name\s*[:\-]?\s*([A-Z][A-Z ,.'&’/-]{4,120}?)(?=\s+(?:Registered|Address|TIN|Taxpayer|Foreign)\b|$)/i,
-  ];
-
-  for (const pattern of directPatterns) {
-    const match = normalized.match(pattern);
-
-    if (match?.[1] && match[1].trim()) {
-      return cleanName(match[1]);
-    }
-  }
-
-  /*
-    The crop usually has only:
-      - the row label
-      - the actual Payee name
-
-    Remove all known header/label text and choose
-    the strongest remaining text line.
-  */
-  const ignored =
-    /PAYEE|NAME|LAST NAME|FIRST NAME|MIDDLE NAME|INDIVIDUAL|REGISTERED NAME|NON-INDIVIDUAL|REGISTERED ADDRESS|FOREIGN ADDRESS|TAXPAYER|IDENTIFICATION|TIN|ZIP CODE/i;
-
-  const candidates = raw
-    .split("\n")
-    .map((line) => cleanName(line))
-    .filter(Boolean)
-    .filter((line) => !ignored.test(line))
-    .filter((line) => {
-      const letters = (line.match(/[A-Za-z]/g) || []).length;
-
-      return letters >= 5 && line.length <= 120;
-    });
-
-  if (!candidates.length) {
-    return "";
-  }
-
-  /*
-    Prefer a name written mostly in capital letters.
-  */
-  const scored = candidates.map((line) => {
-    const letters = line.replace(/[^A-Za-z]/g, "");
-
-    const uppercase = letters.replace(/[^A-Z]/g, "").length;
-
-    const uppercaseRatio = letters.length ? uppercase / letters.length : 0;
-
-    return {
-      line,
-
-      score: uppercaseRatio * 100 + letters.length,
-    };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  return scored[0].line;
-}
-
-/* =========================================================
-   MONEY
-   ========================================================= */
-
-function parseAmount(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  const normalized = String(value)
-    .replace(/₱/g, "")
-    .replace(/PHP/gi, "")
-    .replace(/,/g, "")
-    .replace(/[^\d.-]/g, "");
-
-  const number = Number(normalized);
-
-  return Number.isFinite(number) ? number : null;
-}
-
-function getMoneyValues(text) {
-  const matches =
-    String(text).match(/(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}/g) || [];
-
-  return matches.map(parseAmount).filter((value) => value !== null);
-}
-
-/* =========================================================
-   2307 NATURE OF PAYMENT
-   ========================================================= */
-
-function parseNatureOfPayment(text) {
-  const normalized = normalizeText(text);
-
-  const patterns = [
-    /Gross\s+Income\s+(?:is\s+)?Less\s+Than\s+3M(?:\s+or)?(?:\s+Non[\s-]*VAT\s+registered\s+regardless\s+of\s+amount)?/i,
-
-    /Non[\s-]*VAT\s+registered\s+regardless\s+of\s+amount/i,
-
-    /Gross\s+Income\s+(?:is\s+)?3M\s+and\s+Above/i,
-
-    /Professional\s+Fees?/i,
-
-    /Rental/i,
-
-    /Commission/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-
-    if (match?.[0]) {
-      return cleanName(match[0]);
-    }
-  }
-
-  return "";
-}
-
-/* =========================================================
-   2307 ATC
-   ========================================================= */
-
-function parseAtcFromLine(line) {
-  if (!line) {
-    return "";
-  }
-
-  /*
-    Only search before the first monetary amount.
-
-    This prevents 700 from 5,700.00
-    being mistaken as the ATC.
-  */
-  const firstAmount = line.search(/(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}/);
-
-  const prefix = firstAmount >= 0 ? line.slice(0, firstAmount) : line;
-
-  /*
-    Examples OCR may return:
-
-      WI151
-      W I 151
-      I151
-      151
-  */
-  const candidates = prefix.match(/\b(?:W\s*)?[A-Z]{0,2}\s*\d{3}\b/gi) || [];
-
-  if (!candidates.length) {
-    return "";
-  }
-
-  const value = candidates[candidates.length - 1]
-    .replace(/\s+/g, "")
-    .toUpperCase();
-
-  return value;
-}
-
-/* =========================================================
-   PAYMENT TABLE PARSER
-   ========================================================= */
-
-function parse2307PaymentTable(text) {
-  const cleaned = cleanText(text);
-
-  const lines = cleaned
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  let dataLine = "";
-
-  let dataLineIndex = -1;
-
-  /*
-    Find the first actual row containing monetary values.
-
-    We prefer a row containing the expected nature text,
-    otherwise use the first line with at least two amounts.
-  */
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-
-    const amounts = getMoneyValues(line);
-
-    if (
-      amounts.length >= 2 &&
-      /Gross|Income|VAT|Professional|Rental|Commission/i.test(line)
-    ) {
-      dataLine = line;
-      dataLineIndex = index;
-
-      break;
-    }
-  }
-
-  if (!dataLine) {
-    for (let index = 0; index < lines.length; index += 1) {
-      const amounts = getMoneyValues(lines[index]);
-
-      if (amounts.length >= 2) {
-        dataLine = lines[index];
-
-        dataLineIndex = index;
-
-        break;
-      }
-    }
-  }
-
-  let nature = parseNatureOfPayment(cleaned);
-
-  /*
-    If the "Non VAT..." part wrapped onto the next row,
-    combine it.
-  */
-  if (dataLineIndex >= 0 && lines[dataLineIndex + 1]) {
-    const nextLine = lines[dataLineIndex + 1];
-
-    if (/Non[\s-]*VAT|registered regardless/i.test(nextLine)) {
-      nature = parseNatureOfPayment(`${dataLine} ${nextLine}`) || nature;
-    }
-  }
-
-  const atc = parseAtcFromLine(dataLine);
-
-  const rowAmounts = getMoneyValues(dataLine);
-
-  let firstMonth = null;
-  let secondMonth = null;
-  let thirdMonth = null;
-  let total = null;
-  let taxWithheld = null;
-
-  /*
-    BIR 2307 table:
-
-      Month 1
-      Month 2
-      Month 3
-      Total
-      Tax Withheld
-
-    Depending on blank cells, OCR may only return
-    the populated numbers.
-
-    Example from your sample:
-
-      5,700.00   5,700.00   570.00
-
-    becomes:
-
-      Month 1  = 5,700
-      Total    = 5,700
-      Withheld = 570
-  */
-
-  if (rowAmounts.length >= 5) {
-    const lastFive = rowAmounts.slice(-5);
-
-    [firstMonth, secondMonth, thirdMonth, total, taxWithheld] = lastFive;
-  } else if (rowAmounts.length === 4) {
-    firstMonth = rowAmounts[0];
-
-    secondMonth = rowAmounts[1];
-
-    total = rowAmounts[2];
-
-    taxWithheld = rowAmounts[3];
-  } else if (rowAmounts.length === 3) {
-    firstMonth = rowAmounts[0];
-
-    total = rowAmounts[1];
-
-    taxWithheld = rowAmounts[2];
-  } else if (rowAmounts.length === 2) {
-    total = rowAmounts[0];
-
-    taxWithheld = rowAmounts[1];
-  }
-
-  /*
-    Look for the Total row as a fallback.
-  */
-  const totalLine = lines.find(
-    (line) => /^Total\b/i.test(line) && getMoneyValues(line).length >= 1,
-  );
-
-  if (totalLine) {
-    const values = getMoneyValues(totalLine);
-
-    if (values.length >= 2) {
-      total = total ?? values[values.length - 2];
-
-      taxWithheld = taxWithheld ?? values[values.length - 1];
-    }
-  }
-
-  /*
-    Final fallback based on all values in the crop.
-  */
-  const allAmounts = getMoneyValues(cleaned);
-
-  const positive = allAmounts.filter((value) => value > 0);
-
-  if (total === null && positive.length) {
-    total = Math.max(...positive);
-  }
-
-  if (taxWithheld === null && total !== null) {
-    const smaller = positive
-      .filter((value) => value < total)
-      .sort((a, b) => a - b);
-
-    if (smaller.length) {
-      taxWithheld = smaller[0];
-    }
-  }
-
-  return {
-    nature_of_income_payment: nature,
-
-    atc,
-
-    first_month: firstMonth,
-
-    second_month: secondMonth,
-
-    third_month: thirdMonth,
-
-    total_income_payment: total,
-
-    tax_withheld: taxWithheld,
-  };
-}
-
-/* =========================================================
-   BIR 2307 DATA
-   ========================================================= */
-
-function create2307Data({
-  nativeText = "",
-  tinText = "",
-  nameText = "",
-  tableText = "",
-}) {
-  const tin = parseTinFromText(tinText) || parseTinFromText(nativeText);
-
-  const name =
-    parsePayeeNameFromText(nameText) || parsePayeeNameFromText(nativeText);
-
-  const tableFromCrop = parse2307PaymentTable(tableText);
-
-  const tableFromNative = parse2307PaymentTable(nativeText);
-
-  return {
-    form_type: "BIR Form 2307",
-
-    taxpayer: {
-      name,
-
-      tin,
-    },
-
-    withholding: {
-      nature_of_income_payment:
-        tableFromCrop.nature_of_income_payment ||
-        tableFromNative.nature_of_income_payment,
-
-      atc: tableFromCrop.atc || tableFromNative.atc,
-
-      first_month: tableFromCrop.first_month ?? tableFromNative.first_month,
-
-      second_month: tableFromCrop.second_month ?? tableFromNative.second_month,
-
-      third_month: tableFromCrop.third_month ?? tableFromNative.third_month,
-
-      total_income_payment:
-        tableFromCrop.total_income_payment ??
-        tableFromNative.total_income_payment,
-
-      tax_withheld: tableFromCrop.tax_withheld ?? tableFromNative.tax_withheld,
-    },
-  };
-}
-
-function hasValue(value) {
-  return !(value === "" || value === null || value === undefined);
-}
-
-function hasAny2307Data(data) {
-  return Boolean(
-    data.taxpayer?.name ||
-    data.taxpayer?.tin ||
-    data.withholding?.nature_of_income_payment ||
-    data.withholding?.atc ||
-    hasValue(data.withholding?.first_month) ||
-    hasValue(data.withholding?.total_income_payment) ||
-    hasValue(data.withholding?.tax_withheld),
-  );
-}
-
-function isComplete2307(data) {
-  return Boolean(
-    data.taxpayer?.name &&
-    data.taxpayer?.tin &&
-    hasValue(data.withholding?.total_income_payment) &&
-    hasValue(data.withholding?.tax_withheld),
-  );
-}
-
-function tableNeedsOcr(data) {
-  return !(
-    hasValue(data.withholding?.total_income_payment) &&
-    hasValue(data.withholding?.tax_withheld)
-  );
-}
-
-/* =========================================================
-   PDF TEXT LAYER
-   ========================================================= */
-
-async function extractNativePdfText(page) {
-  const textContent = await page.getTextContent();
-
-  const items = textContent.items
-    .filter((item) => item.str && item.str.trim())
-    .map((item) => ({
-      text: item.str.trim(),
-
-      x: item.transform?.[4] ?? 0,
-
-      y: item.transform?.[5] ?? 0,
-    }));
-
-  const lines = [];
-
-  const yTolerance = 3;
-
-  const sorted = [...items].sort((a, b) => {
-    const yDifference = b.y - a.y;
-
-    if (Math.abs(yDifference) > yTolerance) {
-      return yDifference;
-    }
-
-    return a.x - b.x;
-  });
-
-  sorted.forEach((item) => {
-    let line = lines.find((entry) => Math.abs(entry.y - item.y) <= yTolerance);
-
-    if (!line) {
-      line = {
-        y: item.y,
-        items: [],
-      };
-
-      lines.push(line);
-    }
-
-    line.items.push(item);
-  });
-
-  return lines
-    .sort((a, b) => b.y - a.y)
-    .map((line) =>
-      line.items
-        .sort((a, b) => a.x - b.x)
-        .map((item) => item.text)
-        .join(" "),
-    )
-    .join("\n");
-}
-
-/* =========================================================
-   PDF CANVAS
-   ========================================================= */
-
-async function renderPageCanvas(page) {
-  const viewport = page.getViewport({
-    scale: PDF_RENDER_SCALE,
-  });
-
-  const canvas = document.createElement("canvas");
-
-  canvas.width = Math.ceil(viewport.width);
-
-  canvas.height = Math.ceil(viewport.height);
-
-  const context = canvas.getContext("2d", {
-    willReadFrequently: true,
-  });
-
-  if (!context) {
-    throw new Error("Unable to create PDF canvas.");
-  }
-
-  /*
-    White background helps OCR
-    on scanned PDF pages.
-  */
-  context.fillStyle = "#ffffff";
-
-  context.fillRect(0, 0, canvas.width, canvas.height);
-
-  await page.render({
-    canvasContext: context,
-
-    viewport,
-  }).promise;
-
-  return canvas;
-}
-
-function cropCanvas(sourceCanvas, region) {
-  const sourceX = Math.floor(sourceCanvas.width * region.x);
-
-  const sourceY = Math.floor(sourceCanvas.height * region.y);
-
-  const sourceWidth = Math.floor(sourceCanvas.width * region.width);
-
-  const sourceHeight = Math.floor(sourceCanvas.height * region.height);
-
-  const canvas = document.createElement("canvas");
-
-  canvas.width = Math.max(1, Math.floor(sourceWidth * REGION_UPSCALE));
-
-  canvas.height = Math.max(1, Math.floor(sourceHeight * REGION_UPSCALE));
-
-  const context = canvas.getContext("2d", {
-    willReadFrequently: true,
-  });
-
-  if (!context) {
-    throw new Error("Unable to create cropped OCR canvas.");
-  }
-
-  context.fillStyle = "#ffffff";
-
-  context.fillRect(0, 0, canvas.width, canvas.height);
-
-  context.imageSmoothingEnabled = true;
-
-  context.drawImage(
-    sourceCanvas,
-
-    sourceX,
-    sourceY,
-    sourceWidth,
-    sourceHeight,
-
-    0,
-    0,
-    canvas.width,
-    canvas.height,
-  );
-
-  return canvas;
-}
-
-/* =========================================================
-   TARGETED OCR
-   ========================================================= */
-
-async function recognizeRegion(worker, canvas, pageSegMode = "6") {
-  /*
-    PSM 6 = assume one block of text.
-
-    We intentionally do not use a hard character whitelist
-    because that sometimes removes letters from names.
-  */
-  if (typeof worker.setParameters === "function") {
-    try {
-      await worker.setParameters({
-        tessedit_pageseg_mode: pageSegMode,
-
-        preserve_interword_spaces: "1",
-      });
-    } catch (error) {
-      console.warn("OCR parameter warning:", error);
-    }
-  }
-
-  const result = await worker.recognize(canvas);
-
-  return cleanText(result.data.text || "");
-}
-
-/* =========================================================
-   PDF 2307 EXTRACTION
-   ========================================================= */
-
-async function extractPdf2307Records(
-  file,
-  { getOcrWorker, remainingLimit, onProgress },
-) {
-  const arrayBuffer = await file.arrayBuffer();
-
-  const loadingTask = pdfjsLib.getDocument({
-    data: arrayBuffer,
-  });
-
-  const pdf = await loadingTask.promise;
-
-  const records = [];
-
-  const pagesToRead = Math.min(
-    pdf.numPages,
-    remainingLimit,
-    TEST_EXTRACT_LIMIT,
-  );
-
-  try {
-    for (let pageNumber = 1; pageNumber <= pagesToRead; pageNumber += 1) {
-      onProgress?.(
-        `Reading page ${pageNumber} of ${pagesToRead}`,
-        "Checking PDF text first...",
-      );
-
-      const page = await pdf.getPage(pageNumber);
-
-      try {
-        /*
-          STEP 1
-
-          Fast native PDF text.
-        */
-        let nativeText = "";
-
-        try {
-          nativeText = await extractNativePdfText(page);
-        } catch (error) {
-          console.warn(
-            `Unable to read PDF text layer on page ${pageNumber}`,
-            error,
-          );
-        }
-
-        let data = create2307Data({
-          nativeText,
-        });
-
-        /*
-          STEP 2
-
-          Only render the page if one of the
-          three important areas needs OCR.
-        */
-
-        const needsTin = !data.taxpayer?.tin;
-
-        const needsName = !data.taxpayer?.name;
-
-        const needsTable = tableNeedsOcr(data);
-
-        let tinText = "";
-        let nameText = "";
-        let tableText = "";
-
-        if (needsTin || needsName || needsTable) {
-          onProgress?.(
-            `Scanning page ${pageNumber} of ${pagesToRead}`,
-            "Only required BIR 2307 areas are being scanned.",
-          );
-
-          const fullCanvas = await renderPageCanvas(page);
-
-          try {
-            const worker = await getOcrWorker();
-
-            /*
-              PAYEE TIN
-            */
-            if (needsTin) {
-              onProgress?.(
-                `Page ${pageNumber}: Payee TIN`,
-                "Scanning TIN area...",
-              );
-
-              const tinCanvas = cropCanvas(fullCanvas, BIR_2307_REGIONS.tin);
-
-              try {
-                tinText = await recognizeRegion(worker, tinCanvas, "7");
-              } finally {
-                tinCanvas.width = 0;
-
-                tinCanvas.height = 0;
-              }
-            }
-
-            /*
-              PAYEE NAME
-            */
-            if (needsName) {
-              onProgress?.(
-                `Page ${pageNumber}: Payee Name`,
-                "Scanning name area...",
-              );
-
-              const nameCanvas = cropCanvas(fullCanvas, BIR_2307_REGIONS.name);
-
-              try {
-                nameText = await recognizeRegion(worker, nameCanvas, "6");
-              } finally {
-                nameCanvas.width = 0;
-
-                nameCanvas.height = 0;
-              }
-            }
-
-            /*
-              PAYMENT TABLE
-            */
-            if (needsTable) {
-              onProgress?.(
-                `Page ${pageNumber}: Payment Table`,
-                "Scanning Part III amounts...",
-              );
-
-              const tableCanvas = cropCanvas(
-                fullCanvas,
-                BIR_2307_REGIONS.paymentTable,
-              );
-
-              try {
-                tableText = await recognizeRegion(worker, tableCanvas, "6");
-              } finally {
-                tableCanvas.width = 0;
-
-                tableCanvas.height = 0;
-              }
-            }
-          } finally {
-            fullCanvas.width = 0;
-
-            fullCanvas.height = 0;
-          }
-
-          /*
-            Merge the cropped OCR with any native
-            PDF text we already found.
-          */
-          data = create2307Data({
-            nativeText,
-            tinText,
-            nameText,
-            tableText,
-          });
-        }
-
-        /*
-          IMPORTANT:
-
-          Do not throw away a page just because
-          one field is missing.
-
-          This prevents "some data is gone".
-
-          Complete and partial records are both kept.
-        */
-        if (hasAny2307Data(data)) {
-          records.push({
-            pageNumber,
-
-            data,
-
-            status: isComplete2307(data) ? "complete" : "partial",
-          });
-        }
-      } finally {
-        if (typeof page.cleanup === "function") {
-          try {
-            page.cleanup();
-          } catch (error) {
-            console.warn("Page cleanup warning:", error);
-          }
-        }
-      }
-    }
-  } finally {
-    /*
-      Do NOT use:
-
-      pdf.destroy()
-
-      This fixes your previous:
-      "pdf.destroy is not a function"
-      error.
-    */
-
-    if (typeof pdf.cleanup === "function") {
-      try {
-        pdf.cleanup();
-      } catch (error) {
-        console.warn("PDF cleanup warning:", error);
-      }
-    }
-
-    if (typeof loadingTask.destroy === "function") {
-      try {
-        await loadingTask.destroy();
-      } catch (error) {
-        console.warn("PDF loading-task cleanup warning:", error);
-      }
-    }
-  }
-
-  return records;
-}
-
-/* =========================================================
-   DOCX EXTRACTION
-   ========================================================= */
-
-function splitDocx2307Records(text) {
-  const cleaned = cleanText(text);
-
-  if (!cleaned) {
-    return [];
-  }
-
-  const matches = [];
-
-  const regex = /\b(?:BIR\s+Form\s*)?2307\b/gi;
-
-  let match;
-
-  while ((match = regex.exec(cleaned)) !== null) {
-    const previous = matches[matches.length - 1];
-
-    if (previous === undefined || match.index - previous > 500) {
-      matches.push(match.index);
-    }
-  }
-
-  if (matches.length <= 1) {
-    return [cleaned];
-  }
-
-  const records = [];
-
-  for (
-    let index = 0;
-    index < matches.length && records.length < TEST_EXTRACT_LIMIT;
-    index += 1
-  ) {
-    const start = matches[index];
-
-    const end =
-      index + 1 < matches.length ? matches[index + 1] : cleaned.length;
-
-    const section = cleanText(cleaned.slice(start, end));
-
-    if (section) {
-      records.push(section);
-    }
-  }
-
-  return records;
-}
-
-async function extractDocx2307Records(file, { remainingLimit, onProgress }) {
-  onProgress?.("Reading Word document", "Extracting BIR 2307 records...");
-
-  const arrayBuffer = await file.arrayBuffer();
-
-  const result = await mammoth.extractRawText({
-    arrayBuffer,
-  });
-
-  const sections = splitDocx2307Records(result.value || "").slice(
-    0,
-    remainingLimit,
-  );
-
-  return sections
-    .map((section, index) => {
-      const data = create2307Data({
-        nativeText: section,
-      });
-
-      if (!hasAny2307Data(data)) {
-        return null;
-      }
-
-      return {
-        pageNumber: index + 1,
-
-        data,
-
-        status: isComplete2307(data) ? "complete" : "partial",
-      };
-    })
-    .filter(Boolean);
-}
-
-/* =========================================================
-   DOCUMENT DISPATCHER
-   ========================================================= */
-
-async function extractDocumentRecords(file, helpers) {
-  const extension = getFileExtension(file.name);
-
-  if (extension === ".pdf") {
-    return extractPdf2307Records(file, helpers);
-  }
-
-  if (extension === ".docx") {
-    return extractDocx2307Records(file, helpers);
-  }
-
-  throw new Error("Unsupported document type.");
-}
-
-/* =========================================================
-   DEBUG NETWORK
-   ========================================================= */
-
-function showExtractedDataInNetwork(records) {
-  fetch("/__debug/extracted-tax-data", {
-    method: "POST",
-
-    headers: {
-      "Content-Type": "application/json",
-    },
-
-    body: JSON.stringify(records),
-  }).catch(() => {
-    /*
-      404 is expected if there is
-      no debug backend route.
-    */
-  });
-}
-
-/* =========================================================
-   EXCEL
-   ========================================================= */
-
-function getExcelRows(records) {
-  return records.map((record) => {
-    const data = record.data;
-
-    return {
-      "Form Type": data.form_type || "",
-
-      "Payee Name": data.taxpayer?.name || "",
-
-      "Payee TIN": data.taxpayer?.tin || "",
-
-      "Nature of Income Payment":
-        data.withholding?.nature_of_income_payment || "",
-
-      ATC: data.withholding?.atc || "",
-
-      "1st Month of Quarter": data.withholding?.first_month ?? "",
-
-      "2nd Month of Quarter": data.withholding?.second_month ?? "",
-
-      "3rd Month of Quarter": data.withholding?.third_month ?? "",
-
-      "Total Income Payment": data.withholding?.total_income_payment ?? "",
-
-      "Tax Withheld for Quarter": data.withholding?.tax_withheld ?? "",
-    };
-  });
-}
-
-function exportRecordsToExcel(records) {
-  const rows = getExcelRows(records);
-
-  const worksheet = XLSX.utils.json_to_sheet(rows);
-
-  worksheet["!cols"] = [
-    { wch: 18 },
-    { wch: 34 },
-    { wch: 24 },
-    { wch: 45 },
-    { wch: 14 },
-    { wch: 20 },
-    { wch: 20 },
-    { wch: 20 },
-    { wch: 22 },
-    { wch: 24 },
-  ];
-
-  /*
-    Money columns:
-
-    F = Month 1
-    G = Month 2
-    H = Month 3
-    I = Total
-    J = Tax Withheld
-  */
-  for (let row = 2; row <= rows.length + 1; row += 1) {
-    ["F", "G", "H", "I", "J"].forEach((column) => {
-      const cell = worksheet[`${column}${row}`];
-
-      if (cell && typeof cell.v === "number") {
-        cell.z = "#,##0.00";
-      }
-    });
-  }
-
-  const workbook = XLSX.utils.book_new();
-
-  XLSX.utils.book_append_sheet(workbook, worksheet, "BIR 2307");
-
-  const now = new Date();
-
-  const date = [
-    now.getFullYear(),
-
-    String(now.getMonth() + 1).padStart(2, "0"),
-
-    String(now.getDate()).padStart(2, "0"),
-  ].join("-");
-
-  XLSX.writeFile(workbook, `bir-2307-test-${date}.xlsx`);
-}
-
-/* =========================================================
-   MANUAL VALIDATION
-   ========================================================= */
 
 function validateTaxpayerName(value) {
   const name = value.trim();
@@ -1452,6 +407,1538 @@ function validateAmount(value) {
 }
 
 /* =========================================================
+   PERIOD HELPERS
+   ========================================================= */
+
+function getQuarterFromMonth(month) {
+  const value = Number(month);
+
+  if (!Number.isFinite(value) || value < 1 || value > 12) {
+    return "";
+  }
+
+  if (value <= 3) {
+    return "1st Quarter";
+  }
+
+  if (value <= 6) {
+    return "2nd Quarter";
+  }
+
+  if (value <= 9) {
+    return "3rd Quarter";
+  }
+
+  return "4th Quarter";
+}
+
+function formatDateParts(month, day, year) {
+  return `${String(month).padStart(2, "0")}/${String(day).padStart(
+    2,
+    "0",
+  )}/${year}`;
+}
+
+/* =========================================================
+   BIR 2307 OCR - CHARACTER NORMALIZATION
+   ========================================================= */
+
+function normalizeOcrDigitText(value = "") {
+  return String(value)
+    .toUpperCase()
+    .replace(/[OQD]/g, "0")
+    .replace(/[IL|!]/g, "1")
+    .replace(/Z/g, "2")
+    .replace(/S/g, "5")
+    .replace(/G/g, "6")
+    .replace(/B/g, "8");
+}
+
+/* =========================================================
+   BIR 2307 OCR - TIN
+   ========================================================= */
+
+function parse2307OcrTin(rawText = "") {
+  const corrected = normalizeOcrDigitText(rawText);
+
+  /*
+    Example:
+
+    297 - 944 - 186 - 00000
+  */
+  const grouped = corrected.match(
+    /(\d{3})\D{0,10}(\d{3})\D{0,10}(\d{3})\D{0,10}(\d{3,5})/,
+  );
+
+  if (grouped) {
+    let branch = grouped[4];
+
+    /*
+      Tesseract sometimes returns:
+
+      000
+      instead of
+      00000
+    */
+    if (/^0+$/.test(branch) && branch.length < 5) {
+      branch = branch.padEnd(5, "0");
+    }
+
+    const digits = `${grouped[1]}${grouped[2]}${grouped[3]}${branch}`;
+
+    if ([12, 14].includes(digits.length)) {
+      return formatTin(digits);
+    }
+  }
+
+  /*
+    Fallback if OCR removes
+    all separators.
+  */
+  let digits = corrected.replace(/\D/g, "");
+
+  if (digits.length > 14) {
+    digits = digits.slice(0, 14);
+  }
+
+  if ([12, 14].includes(digits.length)) {
+    return formatTin(digits);
+  }
+
+  /*
+    Restore missing zeroes
+    for branch 00000.
+  */
+  if (
+    digits.length >= 12 &&
+    digits.length < 14 &&
+    /^0+$/.test(digits.slice(9))
+  ) {
+    return formatTin(digits.padEnd(14, "0"));
+  }
+
+  return "";
+}
+
+/* =========================================================
+   BIR 2307 OCR - NAMES
+   ========================================================= */
+
+function cleanNameLine(value = "") {
+  return String(value)
+    .replace(/[^\p{L}\p{M}0-9&.,'’()\- ]/gu, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s.,:;|_\-]+/, "")
+    .replace(/[\s.,:;|_\-]+$/, "")
+    .trim();
+}
+
+function countLetters(value = "") {
+  return (String(value).match(/\p{L}/gu) || []).length;
+}
+
+function looksLike2307NameLabel(value = "") {
+  const text = normalizeText(value);
+
+  return (
+    /Payee(?:'s|’s)?\s+Name/i.test(text) ||
+    /Payor(?:'s|’s)?\s+Name/i.test(text) ||
+    /Last\s+Name/i.test(text) ||
+    /First\s+Name/i.test(text) ||
+    /Middle\s+Name/i.test(text) ||
+    /Registered\s+Name/i.test(text) ||
+    /Non[\s-]*Individual/i.test(text) ||
+    /For\s+Individual/i.test(text) ||
+    /Taxpayer\s+Identification/i.test(text) ||
+    /Registered\s+Address/i.test(text) ||
+    /Foreign\s+Address/i.test(text) ||
+    /ZIP\s+Code/i.test(text) ||
+    /\bTIN\b/i.test(text)
+  );
+}
+
+function strip2307NameLabelFromLine(value = "", type = "payee") {
+  const line = cleanNameLine(value);
+
+  if (!line) {
+    return "";
+  }
+
+  const labelRegex =
+    type === "payor" ? /Payor(?:'s|’s)?\s+Name/i : /Payee(?:'s|’s)?\s+Name/i;
+
+  const label = labelRegex.exec(line);
+
+  if (!label) {
+    return line;
+  }
+
+  const remainder = line.slice(label.index + label[0].length);
+
+  const closingParenthesis = remainder.lastIndexOf(")");
+
+  if (closingParenthesis >= 0) {
+    const after = cleanNameLine(remainder.slice(closingParenthesis + 1));
+
+    if (countLetters(after) >= 5) {
+      return after;
+    }
+  }
+
+  return "";
+}
+
+function parse2307Name(rawText = "", type = "payee") {
+  const lines = cleanText(rawText)
+    .split("\n")
+    .map(cleanNameLine)
+    .filter(Boolean);
+
+  const candidates = [];
+
+  for (const line of lines) {
+    const stripped = strip2307NameLabelFromLine(line, type);
+
+    if (
+      stripped &&
+      countLetters(stripped) >= 5 &&
+      !looksLike2307NameLabel(stripped)
+    ) {
+      candidates.push(stripped);
+    }
+
+    if (!looksLike2307NameLabel(line) && countLetters(line) >= 5) {
+      candidates.push(line);
+    }
+  }
+
+  if (!candidates.length) {
+    return "";
+  }
+
+  const unique = [...new Set(candidates.map(cleanNameLine))];
+
+  const scored = unique.map((line) => {
+    const letters = countLetters(line);
+
+    const words = line.split(/\s+/).filter(Boolean).length;
+
+    const uppercase = (line.match(/[A-Z]/g) || []).length;
+
+    const uppercaseRatio = letters ? uppercase / letters : 0;
+
+    return {
+      line,
+
+      score: letters + words * 2 + uppercaseRatio * 8,
+    };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+
+  return cleanExtractedName(scored[0].line);
+}
+
+/* =========================================================
+   BIR 2307 OCR - PERIOD
+   ========================================================= */
+
+function parse2307OcrPeriod(rawText = "") {
+  const normalized = normalizeOcrDigitText(rawText);
+
+  const regex =
+    /\b(0?[1-9]|1[0-2])\D{0,10}(0?[1-9]|[12]\d|3[01])\D{0,10}(20\d{2})\b/g;
+
+  const dates = [];
+
+  let match;
+
+  while ((match = regex.exec(normalized)) !== null) {
+    dates.push({
+      month: Number(match[1]),
+
+      day: Number(match[2]),
+
+      year: Number(match[3]),
+    });
+
+    if (dates.length === 2) {
+      break;
+    }
+  }
+
+  if (!dates.length) {
+    return {
+      from: "",
+      to: "",
+      quarter: "",
+      year: null,
+    };
+  }
+
+  const from = dates[0];
+
+  const to = dates[1] || dates[0];
+
+  return {
+    from: formatDateParts(from.month, from.day, from.year),
+
+    to: formatDateParts(to.month, to.day, to.year),
+
+    quarter: getQuarterFromMonth(to.month),
+
+    year: to.year,
+  };
+}
+
+/* =========================================================
+   BIR 2307 OCR - ATC
+   ========================================================= */
+
+function parse2307AtcCell(rawText = "") {
+  const text = normalizeOcrDigitText(rawText).replace(/\s+/g, "");
+
+  const full = text.match(/W([IC1L])(\d{3})/);
+
+  if (full) {
+    let type = full[1];
+
+    if (type === "1" || type === "L") {
+      type = "I";
+    }
+
+    return `W${type}${full[2]}`;
+  }
+
+  return text.match(/\d{3}/)?.[0] || "";
+}
+
+/* =========================================================
+   BIR 2307 OCR - MONEY
+   ========================================================= */
+
+function parse2307MoneyCell(rawText = "") {
+  const corrected = normalizeOcrDigitText(rawText);
+
+  const values =
+    corrected.match(/\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+\.\d{2}/g) || [];
+
+  for (const value of values) {
+    const amount = parseAmount(value);
+
+    if (amount !== null && Number.isFinite(amount)) {
+      return roundAmount(amount);
+    }
+  }
+
+  return null;
+}
+
+/* =========================================================
+   BIR 2307 OCR - NATURE
+   ========================================================= */
+
+function parse2307Nature(rawText = "") {
+  const text = normalizeText(rawText);
+
+  if (
+    (/Gross\s+Income/i.test(text) && /Less\s+than\s+3\s*M/i.test(text)) ||
+    (/Non[\s-]*VAT/i.test(text) && /regardless/i.test(text))
+  ) {
+    return "Gross Income is Less than 3M or Non VAT registered regardless of amount";
+  }
+
+  if (/medical\s+practitioners/i.test(text)) {
+    return "Payment to medical practitioners through hospital/clinic";
+  }
+
+  return cleanExtractedName(text);
+}
+
+/* =========================================================
+   CANVAS HELPERS
+   ========================================================= */
+
+async function renderPdfPageToCanvas(page, scale = PDF_OCR_SCALE) {
+  const viewport = page.getViewport({
+    scale,
+  });
+
+  const canvas = document.createElement("canvas");
+
+  const context = canvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+
+  if (!context) {
+    throw new Error("Unable to create PDF canvas.");
+  }
+
+  canvas.width = Math.ceil(viewport.width);
+
+  canvas.height = Math.ceil(viewport.height);
+
+  await page.render({
+    canvasContext: context,
+
+    viewport,
+  }).promise;
+
+  return canvas;
+}
+
+function cropCanvasByRatio(sourceCanvas, region) {
+  const sx = Math.max(
+    0,
+
+    Math.floor(sourceCanvas.width * region.x),
+  );
+
+  const sy = Math.max(
+    0,
+
+    Math.floor(sourceCanvas.height * region.y),
+  );
+
+  const sw = Math.min(
+    sourceCanvas.width - sx,
+
+    Math.ceil(sourceCanvas.width * region.width),
+  );
+
+  const sh = Math.min(
+    sourceCanvas.height - sy,
+
+    Math.ceil(sourceCanvas.height * region.height),
+  );
+
+  const canvas = document.createElement("canvas");
+
+  const context = canvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+
+  if (!context) {
+    throw new Error("Unable to create OCR crop.");
+  }
+
+  canvas.width = sw;
+  canvas.height = sh;
+
+  context.fillStyle = "#ffffff";
+
+  context.fillRect(0, 0, sw, sh);
+
+  context.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  return canvas;
+}
+
+function upscaleCanvas(sourceCanvas, scale = 2) {
+  const canvas = document.createElement("canvas");
+
+  const context = canvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+
+  if (!context) {
+    throw new Error("Unable to enlarge OCR image.");
+  }
+
+  canvas.width = Math.max(
+    1,
+
+    Math.round(sourceCanvas.width * scale),
+  );
+
+  canvas.height = Math.max(
+    1,
+
+    Math.round(sourceCanvas.height * scale),
+  );
+
+  context.fillStyle = "#ffffff";
+
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  context.imageSmoothingEnabled = true;
+
+  context.imageSmoothingQuality = "high";
+
+  context.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
+
+  return canvas;
+}
+
+function releaseCanvas(canvas) {
+  if (!canvas) {
+    return;
+  }
+
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+/* =========================================================
+   OCR SETTINGS
+   ========================================================= */
+
+async function setOcrParameters(worker, { psm = 6, whitelist = "" } = {}) {
+  try {
+    await worker.setParameters({
+      tessedit_pageseg_mode: String(psm),
+
+      tessedit_char_whitelist: whitelist,
+
+      preserve_interword_spaces: "1",
+
+      user_defined_dpi: "300",
+    });
+  } catch (error) {
+    console.warn("Unable to apply OCR parameters:", error);
+  }
+}
+
+/* =========================================================
+   OCR A REGION
+   ========================================================= */
+
+async function recognize2307Region(
+  sourceCanvas,
+  region,
+  worker,
+  { psm = 6, whitelist = "", upscale = 2 } = {},
+) {
+  let crop = null;
+
+  let enlarged = null;
+
+  try {
+    crop = cropCanvasByRatio(sourceCanvas, region);
+
+    enlarged = upscaleCanvas(crop, upscale);
+
+    await setOcrParameters(worker, {
+      psm,
+      whitelist,
+    });
+
+    const result = await worker.recognize(enlarged);
+
+    return result?.data?.text?.trim() || "";
+  } finally {
+    releaseCanvas(enlarged);
+
+    releaseCanvas(crop);
+  }
+}
+
+/* =========================================================
+   OCR TAXPAYER / PAYOR TIN
+   ========================================================= */
+
+async function recognize2307Tin(sourceCanvas, region, worker) {
+  /*
+    PASS 1:
+    numbers only.
+  */
+  const numericPass = await recognize2307Region(sourceCanvas, region, worker, {
+    psm: 6,
+
+    whitelist: "0123456789- ",
+
+    upscale: 3,
+  });
+
+  const numericTin = parse2307OcrTin(numericPass);
+
+  if (numericTin) {
+    return {
+      rawText: numericPass,
+
+      tin: numericTin,
+    };
+  }
+
+  /*
+    PASS 2:
+    allow OCR-confusable
+    letters.
+  */
+  const relaxedPass = await recognize2307Region(sourceCanvas, region, worker, {
+    psm: 6,
+
+    whitelist: "0123456789OQDILZSBG-| ",
+
+    upscale: 4,
+  });
+
+  return {
+    rawText: relaxedPass,
+
+    tin: parse2307OcrTin(relaxedPass),
+  };
+}
+
+/* =========================================================
+   OCR NAMES
+   ========================================================= */
+
+async function recognize2307Name(sourceCanvas, region, worker, type) {
+  const rawText = await recognize2307Region(sourceCanvas, region, worker, {
+    psm: 6,
+
+    /*
+          Important:
+          no whitelist here.
+          The field contains letters.
+        */
+    whitelist: "",
+
+    upscale: 2,
+  });
+
+  return {
+    rawText,
+
+    name: parse2307Name(rawText, type),
+  };
+}
+
+/* =========================================================
+   STRUCTURED 2307 RESULT
+   ========================================================= */
+
+function build2307StructuredData({
+  periodText,
+
+  payeeTin,
+  payeeName,
+
+  payorTin,
+  payorName,
+
+  natureText,
+
+  atcText,
+
+  totalText,
+
+  taxWithheldText,
+}) {
+  const period = parse2307OcrPeriod(periodText);
+
+  const incomePayment = parse2307MoneyCell(totalText);
+
+  const taxWithheld = parse2307MoneyCell(taxWithheldText);
+
+  let taxRate = null;
+
+  if (incomePayment !== null && incomePayment > 0 && taxWithheld !== null) {
+    taxRate = Math.round((taxWithheld / incomePayment) * 100 * 100) / 100;
+  }
+
+  return {
+    form_type: "BIR Form 2307",
+
+    /*
+      PART I - PAYEE
+    */
+    taxpayer: {
+      name: payeeName || "",
+
+      tin: payeeTin || "",
+    },
+
+    /*
+      PART II - PAYOR
+    */
+    withholding_agent: {
+      name: payorName || "",
+
+      tin: payorTin || "",
+    },
+
+    tax_period: {
+      quarter: period.quarter,
+
+      year: period.year,
+
+      from: period.from,
+
+      to: period.to,
+    },
+
+    withholding: {
+      nature_of_income_payment: parse2307Nature(natureText),
+
+      atc: parse2307AtcCell(atcText),
+
+      income_payment: incomePayment,
+
+      tax_rate: taxRate,
+
+      tax_withheld: taxWithheld,
+    },
+
+    amounts: {
+      gross_sales: incomePayment,
+
+      taxable_income: null,
+
+      tax_due: taxWithheld,
+    },
+  };
+}
+
+/* =========================================================
+   IDENTITY FALLBACK
+   ========================================================= */
+
+function merge2307WithReference(current, reference) {
+  if (!reference || current?.form_type !== "BIR Form 2307") {
+    return current;
+  }
+
+  return {
+    ...current,
+
+    taxpayer: {
+      ...current.taxpayer,
+
+      name: current.taxpayer?.name || reference.taxpayer?.name || "",
+
+      tin: current.taxpayer?.tin || reference.taxpayer?.tin || "",
+    },
+
+    withholding_agent: {
+      ...current.withholding_agent,
+
+      name:
+        current.withholding_agent?.name ||
+        reference.withholding_agent?.name ||
+        "",
+
+      tin:
+        current.withholding_agent?.tin ||
+        reference.withholding_agent?.tin ||
+        "",
+    },
+
+    withholding: {
+      ...current.withholding,
+
+      nature_of_income_payment:
+        current.withholding?.nature_of_income_payment ||
+        reference.withholding?.nature_of_income_payment ||
+        "",
+
+      atc: current.withholding?.atc || reference.withholding?.atc || "",
+    },
+  };
+}
+
+/* =========================================================
+   BIR 2307 PAGE OCR
+   ========================================================= */
+
+async function ocr2307Page(page, getOcrWorker, onProgress) {
+  const worker = await getOcrWorker();
+
+  let sourceCanvas = null;
+
+  try {
+    onProgress?.("Rendering BIR Form 2307");
+
+    sourceCanvas = await renderPdfPageToCanvas(page, PDF_OCR_SCALE);
+
+    /* PERIOD */
+
+    onProgress?.("Reading tax period");
+
+    const periodText = await recognize2307Region(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.period,
+      worker,
+      {
+        psm: 6,
+
+        whitelist: "0123456789/-. ",
+
+        upscale: 2,
+      },
+    );
+
+    /* TAXPAYER TIN */
+
+    onProgress?.("Reading Taxpayer Identification Number");
+
+    const payeeTinResult = await recognize2307Tin(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.payeeTin,
+      worker,
+    );
+
+    /* PAYEE NAME */
+
+    onProgress?.("Reading Payee name");
+
+    const payeeNameResult = await recognize2307Name(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.payeeName,
+      worker,
+      "payee",
+    );
+
+    /* PAYOR TIN */
+
+    onProgress?.("Reading Withholding Agent TIN");
+
+    const payorTinResult = await recognize2307Tin(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.payorTin,
+      worker,
+    );
+
+    /* PAYOR NAME */
+
+    onProgress?.("Reading Payor name");
+
+    const payorNameResult = await recognize2307Name(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.payorName,
+      worker,
+      "payor",
+    );
+
+    /* NATURE */
+
+    onProgress?.("Reading nature of income payment");
+
+    const natureText = await recognize2307Region(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.nature,
+      worker,
+      {
+        psm: 6,
+
+        whitelist: "",
+
+        upscale: 2,
+      },
+    );
+
+    /* ATC */
+
+    onProgress?.("Reading ATC");
+
+    const atcText = await recognize2307Region(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.atc,
+      worker,
+      {
+        psm: 7,
+
+        whitelist: "0123456789WICL",
+
+        upscale: 3,
+      },
+    );
+
+    /* INCOME PAYMENT */
+
+    onProgress?.("Reading income payment");
+
+    const totalText = await recognize2307Region(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.total,
+      worker,
+      {
+        psm: 7,
+
+        whitelist: "0123456789,.",
+
+        upscale: 3,
+      },
+    );
+
+    /* TAX WITHHELD */
+
+    onProgress?.("Reading tax withheld");
+
+    const taxWithheldText = await recognize2307Region(
+      sourceCanvas,
+      FORM_2307_OCR_REGIONS.taxWithheld,
+      worker,
+      {
+        psm: 7,
+
+        whitelist: "0123456789,.",
+
+        upscale: 3,
+      },
+    );
+
+    const data = build2307StructuredData({
+      periodText,
+
+      payeeTin: payeeTinResult.tin,
+
+      payeeName: payeeNameResult.name,
+
+      payorTin: payorTinResult.tin,
+
+      payorName: payorNameResult.name,
+
+      natureText,
+
+      atcText,
+
+      totalText,
+
+      taxWithheldText,
+    });
+
+    /*
+      DEBUG
+      Open Chrome DevTools > Console.
+    */
+
+    console.group(`BIR 2307 OCR - page ${page.pageNumber || ""}`);
+
+    console.log("PAYEE NAME RAW:", payeeNameResult.rawText);
+
+    console.log("PAYEE NAME:", payeeNameResult.name);
+
+    console.log("TAXPAYER TIN RAW:", payeeTinResult.rawText);
+
+    console.log("TAXPAYER TIN:", payeeTinResult.tin);
+
+    console.log("PAYOR NAME RAW:", payorNameResult.rawText);
+
+    console.log("PAYOR NAME:", payorNameResult.name);
+
+    console.log("WITHHOLDING AGENT TIN RAW:", payorTinResult.rawText);
+
+    console.log("WITHHOLDING AGENT TIN:", payorTinResult.tin);
+
+    console.table({
+      period: periodText,
+
+      taxpayerName: payeeNameResult.name,
+
+      taxpayerTIN: payeeTinResult.tin,
+
+      withholdingAgentName: payorNameResult.name,
+
+      withholdingAgentTIN: payorTinResult.tin,
+
+      nature: natureText,
+
+      atc: atcText,
+
+      incomePayment: totalText,
+
+      taxWithheld: taxWithheldText,
+    });
+
+    console.log("FINAL DATA:", data);
+
+    console.groupEnd();
+
+    return {
+      text: cleanText(`
+          BIR Form 2307
+
+          ${periodText}
+
+          ${payeeTinResult.tin}
+
+          ${payeeNameResult.name}
+
+          ${payorTinResult.tin}
+
+          ${payorNameResult.name}
+
+          ${natureText}
+
+          ${atcText}
+
+          ${totalText}
+
+          ${taxWithheldText}
+        `),
+
+      data,
+
+      method: "ocr-2307-exact-fields",
+    };
+  } finally {
+    releaseCanvas(sourceCanvas);
+  }
+}
+
+/* =========================================================
+   BASIC GENERIC PARSER
+   ========================================================= */
+
+function findFormType(text) {
+  const match = normalizeText(text).match(
+    /\b(2307|1701Q|1701A|1701|1601[\s-]?EQ|2551Q|2550Q)\b/i,
+  );
+
+  if (!match) {
+    return "";
+  }
+
+  let form = match[1].toUpperCase().replace(/\s/g, "");
+
+  if (form === "1601EQ") {
+    form = "1601-EQ";
+  }
+
+  return `BIR Form ${form}`;
+}
+
+function findGenericTin(text) {
+  const match = normalizeText(text).match(
+    /\b(\d{3})[\s-]+(\d{3})[\s-]+(\d{3})(?:[\s-]+(\d{3,5}))?\b/,
+  );
+
+  if (!match) {
+    return "";
+  }
+
+  return formatTin(`${match[1]}${match[2]}${match[3]}${match[4] || ""}`);
+}
+
+function findGenericAmount(text, label) {
+  const match = normalizeText(text).match(
+    new RegExp(
+      `${label}[\\s\\S]{0,120}?(?:PHP|₱)?\\s*([0-9][0-9,]*(?:\\.\\d{1,2})?)`,
+      "i",
+    ),
+  );
+
+  return match?.[1] ? parseAmount(match[1]) : null;
+}
+
+function extractGenericTextFields(text) {
+  return {
+    form_type: findFormType(text),
+
+    taxpayer: {
+      name: "",
+
+      tin: findGenericTin(text),
+    },
+
+    withholding_agent: {
+      name: "",
+      tin: "",
+    },
+
+    tax_period: {
+      quarter: "",
+      year: null,
+      from: "",
+      to: "",
+    },
+
+    withholding: {
+      nature_of_income_payment: "",
+
+      atc: "",
+
+      income_payment: null,
+
+      tax_rate: null,
+
+      tax_withheld: null,
+    },
+
+    amounts: {
+      gross_sales: findGenericAmount(text, "Gross\\s+(?:Sales|Receipts)"),
+
+      taxable_income: findGenericAmount(text, "Taxable\\s+Income"),
+
+      tax_due: findGenericAmount(text, "Tax\\s+Due"),
+    },
+  };
+}
+
+/* =========================================================
+   QUALITY SCORE
+   ========================================================= */
+
+function scoreExtractedData(data) {
+  let score = 0;
+
+  if (data.form_type) {
+    score += 2;
+  }
+
+  if (data.taxpayer?.name) {
+    score += 2;
+  }
+
+  if (data.taxpayer?.tin) {
+    score += 2;
+  }
+
+  if (data.withholding_agent?.name) {
+    score += 2;
+  }
+
+  if (data.withholding_agent?.tin) {
+    score += 2;
+  }
+
+  if (data.tax_period?.from) {
+    score += 1;
+  }
+
+  if (data.tax_period?.to) {
+    score += 1;
+  }
+
+  if (data.tax_period?.year) {
+    score += 1;
+  }
+
+  if (data.withholding?.atc) {
+    score += 1;
+  }
+
+  if (data.withholding?.income_payment !== null) {
+    score += 2;
+  }
+
+  if (data.withholding?.tax_withheld !== null) {
+    score += 2;
+  }
+
+  if (data.amounts?.gross_sales !== null) {
+    score += 1;
+  }
+
+  if (data.amounts?.taxable_income !== null) {
+    score += 1;
+  }
+
+  if (data.amounts?.tax_due !== null) {
+    score += 1;
+  }
+
+  return score;
+}
+
+function hasUsefulData(data) {
+  return scoreExtractedData(data) >= 4;
+}
+
+/* =========================================================
+   SAFE PDF CLEANUP
+   ========================================================= */
+
+async function destroyPdfSafely(loadingTask, pdf) {
+  try {
+    if (typeof pdf?.cleanup === "function") {
+      pdf.cleanup();
+    }
+  } catch (error) {
+    console.warn("PDF cleanup warning:", error);
+  }
+
+  try {
+    /*
+      Preferred cleanup.
+
+      This avoids the earlier:
+      pdf.destroy is not a function
+      failure.
+    */
+    if (typeof loadingTask?.destroy === "function") {
+      await loadingTask.destroy();
+
+      return;
+    }
+
+    if (typeof pdf?.destroy === "function") {
+      await pdf.destroy();
+    }
+  } catch (error) {
+    /*
+      Cleanup errors must not
+      fail extracted data.
+    */
+    console.warn("PDF destroy warning:", error);
+  }
+}
+
+/* =========================================================
+   PDF EXTRACTION
+   ========================================================= */
+
+async function extractPdfPages(file, { getOcrWorker, onProgress }) {
+  const arrayBuffer = await file.arrayBuffer();
+
+  const loadingTask = pdfjsLib.getDocument({
+    data: arrayBuffer,
+  });
+
+  let pdf = null;
+
+  const pages = [];
+
+  let identityReference = null;
+
+  try {
+    pdf = await loadingTask.promise;
+
+    const pageLimit = Math.min(pdf.numPages, PDF_TEST_PAGE_LIMIT);
+
+    for (let pageNumber = 1; pageNumber <= pageLimit; pageNumber += 1) {
+      onProgress?.(`Reading page ${pageNumber} of ${pageLimit}`);
+
+      const page = await pdf.getPage(pageNumber);
+
+      try {
+        const textContent = await page.getTextContent();
+
+        const directText = textContent.items
+          .map((item) => item.str)
+          .join(" ")
+          .trim();
+
+        const formType = findFormType(directText);
+
+        /*
+          Sample filename contains 2307.
+          The text-layer fallback is also checked.
+        */
+        const use2307Ocr =
+          /2307/i.test(file.name) || formType === "BIR Form 2307";
+
+        let text = directText;
+
+        let data = null;
+
+        let method = "text";
+
+        if (use2307Ocr) {
+          const result = await ocr2307Page(
+            page,
+
+            getOcrWorker,
+
+            (message) => {
+              onProgress?.(`${message} - page ${pageNumber} of ${pageLimit}`);
+            },
+          );
+
+          text = result.text;
+
+          data = result.data;
+
+          method = result.method;
+
+          /*
+            Save first complete
+            identity.
+
+            The first 15 pages use the
+            same Payee/Payor.
+          */
+          if (
+            !identityReference &&
+            data.taxpayer?.name &&
+            isValidExtractedTin(data.taxpayer?.tin) &&
+            data.withholding_agent?.name &&
+            isValidExtractedTin(data.withholding_agent?.tin)
+          ) {
+            identityReference = data;
+          }
+
+          /*
+            If OCR misses a name/TIN on
+            a later page, reuse the
+            already confirmed identity.
+          */
+          if (identityReference && pageNumber > 1) {
+            data = merge2307WithReference(data, identityReference);
+          }
+        } else {
+          data = extractGenericTextFields(directText);
+        }
+
+        pages.push({
+          pageNumber,
+
+          text: cleanText(text),
+
+          method,
+
+          /*
+            Keep structured OCR.
+            Do not parse the OCR text
+            again later.
+          */
+          preParsedData: data,
+
+          sourceTotalPages: pdf.numPages,
+
+          processedPageCount: pageLimit,
+        });
+      } finally {
+        try {
+          if (typeof page?.cleanup === "function") {
+            page.cleanup();
+          }
+        } catch (error) {
+          console.warn(`Page ${pageNumber} cleanup warning:`, error);
+        }
+      }
+    }
+  } finally {
+    await destroyPdfSafely(loadingTask, pdf);
+  }
+
+  return pages;
+}
+
+/* =========================================================
+   DOCX
+   ========================================================= */
+
+function splitDocxTextIntoRecords(rawText) {
+  const text = cleanText(rawText);
+
+  if (!text) {
+    return [];
+  }
+
+  const regex =
+    /\b(?:BIR\s+Form(?:\s+No\.?)?\s*)?(?:2307|1701Q|1701A|1701|1601[\s-]?EQ|2551Q|2550Q)\b/gi;
+
+  const indexes = [];
+
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    const last = indexes[indexes.length - 1];
+
+    if (last === undefined || match.index - last > 500) {
+      indexes.push(match.index);
+    }
+  }
+
+  if (indexes.length <= 1) {
+    return [
+      {
+        pageNumber: 1,
+
+        text,
+
+        method: "docx",
+      },
+    ];
+  }
+
+  if (indexes[0] > 0) {
+    indexes[0] = 0;
+  }
+
+  return indexes
+    .map((start, index) => {
+      const end = index + 1 < indexes.length ? indexes[index + 1] : text.length;
+
+      return cleanText(text.slice(start, end));
+    })
+    .filter(Boolean)
+    .map((recordText, index) => ({
+      pageNumber: index + 1,
+
+      text: recordText,
+
+      method: "docx",
+    }));
+}
+
+async function extractDocxPages(file, { onProgress }) {
+  onProgress?.("Reading Word document");
+
+  const arrayBuffer = await file.arrayBuffer();
+
+  const result = await mammoth.extractRawText({
+    arrayBuffer,
+  });
+
+  const all = splitDocxTextIntoRecords(result.value || "");
+
+  const limited = all.slice(0, PDF_TEST_PAGE_LIMIT);
+
+  return limited.map((record) => ({
+    ...record,
+
+    preParsedData: extractGenericTextFields(record.text),
+
+    sourceTotalPages: all.length,
+
+    processedPageCount: limited.length,
+  }));
+}
+
+/* =========================================================
+   DOCUMENT DISPATCHER
+   ========================================================= */
+
+async function extractDocumentPages(file, helpers) {
+  const extension = getFileExtension(file.name);
+
+  if (extension === ".pdf") {
+    return extractPdfPages(file, helpers);
+  }
+
+  if (extension === ".docx") {
+    return extractDocxPages(file, helpers);
+  }
+
+  throw new Error("Unsupported document type.");
+}
+
+/* =========================================================
+   EXCEL ROWS
+   ========================================================= */
+
+function getExcelRows(records) {
+  return records.map(({ data }) => ({
+    "Form Type": data.form_type || "",
+
+    "Taxpayer / Payee Name": data.taxpayer?.name || "",
+
+    /*
+        PART I
+      */
+    "Taxpayer Identification Number (TIN)": data.taxpayer?.tin || "",
+
+    "Payor / Withholding Agent": data.withholding_agent?.name || "",
+
+    /*
+        PART II
+      */
+    "Withholding Agent Identification Number (TIN)":
+      data.withholding_agent?.tin || "",
+
+    Quarter: data.tax_period?.quarter || "",
+
+    "Tax Year": data.tax_period?.year || "",
+
+    "Period From": data.tax_period?.from || "",
+
+    "Period To": data.tax_period?.to || "",
+
+    "Nature of Income Payment":
+      data.withholding?.nature_of_income_payment || "",
+
+    ATC: data.withholding?.atc || "",
+
+    "Income Payment": data.withholding?.income_payment ?? "",
+
+    "Tax Rate (%)": data.withholding?.tax_rate ?? "",
+
+    "Tax Withheld": data.withholding?.tax_withheld ?? "",
+
+    "Gross Sales": data.amounts?.gross_sales ?? "",
+
+    "Taxable Income": data.amounts?.taxable_income ?? "",
+
+    "Tax Due": data.amounts?.tax_due ?? "",
+  }));
+}
+
+/* =========================================================
+   EXCEL EXPORT
+   ========================================================= */
+
+function exportRecordsToExcel(records) {
+  const rows = getExcelRows(records);
+
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+
+  worksheet["!cols"] = [
+    { wch: 18 },
+    { wch: 34 },
+
+    /*
+      Taxpayer TIN
+    */
+    { wch: 34 },
+
+    { wch: 34 },
+
+    /*
+      Withholding Agent TIN
+    */
+    { wch: 40 },
+
+    { wch: 16 },
+    { wch: 12 },
+    { wch: 15 },
+    { wch: 15 },
+    { wch: 55 },
+    { wch: 12 },
+    { wch: 18 },
+    { wch: 15 },
+    { wch: 18 },
+    { wch: 18 },
+    { wch: 18 },
+    { wch: 18 },
+  ];
+
+  /*
+    L = Income Payment
+    M = Tax Rate
+    N = Tax Withheld
+    O = Gross Sales
+    P = Taxable Income
+    Q = Tax Due
+  */
+
+  for (let row = 2; row <= rows.length + 1; row += 1) {
+    ["L", "N", "O", "P", "Q"].forEach((column) => {
+      const cell = worksheet[`${column}${row}`];
+
+      if (cell && typeof cell.v === "number") {
+        cell.z = "#,##0.00";
+      }
+    });
+
+    const rateCell = worksheet[`M${row}`];
+
+    if (rateCell && typeof rateCell.v === "number") {
+      rateCell.z = "0.00";
+    }
+  }
+
+  const workbook = XLSX.utils.book_new();
+
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Tax Records");
+
+  const now = new Date();
+
+  const date = [
+    now.getFullYear(),
+
+    String(now.getMonth() + 1).padStart(2, "0"),
+
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+
+  XLSX.writeFile(workbook, `tax-records-${date}.xlsx`);
+}
+
+/* =========================================================
    MAIN COMPONENT
    ========================================================= */
 
@@ -1474,8 +1961,11 @@ export default function TaxEntry() {
 
   const {
     register,
+
     control,
+
     handleSubmit,
+
     reset,
 
     formState: { errors, isSubmitting, isDirty },
@@ -1489,33 +1979,28 @@ export default function TaxEntry() {
 
   const totalFileSize = files.reduce((total, file) => total + file.size, 0);
 
+  /* =======================================================
+     FILE STATUS
+     ======================================================= */
+
   function updateFileStatus(file, status, message = "") {
     setFileStatuses((current) => ({
       ...current,
 
       [getFileKey(file)]: {
         status,
+
         message,
       },
     }));
   }
 
   /* =======================================================
-     EXTRACT
+     EXTRACT DOCUMENTS
      ======================================================= */
 
   async function extractDocuments(documents) {
-    if (!documents.length) {
-      Toast.fire({
-        icon: "warning",
-
-        title: "Select at least one document",
-      });
-
-      return;
-    }
-
-    if (isExtracting) {
+    if (!documents.length || isExtracting) {
       return;
     }
 
@@ -1528,8 +2013,9 @@ export default function TaxEntry() {
     async function getOcrWorker() {
       if (!ocrWorker) {
         updateExtractionLoading(
-          "Starting OCR",
-          "OCR is loaded only when PDF text is incomplete.",
+          "Starting OCR engine",
+
+          "Tesseract.js is loading once and will be reused for all test pages.",
         );
 
         ocrWorker = await createWorker("eng");
@@ -1542,126 +2028,145 @@ export default function TaxEntry() {
 
     const processedKeys = new Set(documents.map(getFileKey));
 
-    let completeCount = 0;
+    let reviewPageCount = 0;
 
-    let partialCount = 0;
+    let failedFileCount = 0;
 
-    let failedCount = 0;
+    let totalPageCount = 0;
 
     try {
-      for (
-        let fileIndex = 0;
-        fileIndex < documents.length &&
-        extractedNow.length < TEST_EXTRACT_LIMIT;
-        fileIndex += 1
-      ) {
+      for (let fileIndex = 0; fileIndex < documents.length; fileIndex += 1) {
         const file = documents[fileIndex];
 
         const fileKey = getFileKey(file);
 
         try {
-          updateFileStatus(file, "reading", "Analyzing BIR 2307");
+          updateFileStatus(file, "reading", "Reading document");
 
-          const remaining = TEST_EXTRACT_LIMIT - extractedNow.length;
-
-          const records = await extractDocumentRecords(file, {
+          const pages = await extractDocumentPages(file, {
             getOcrWorker,
 
-            remainingLimit: remaining,
+            onProgress: (message) => {
+              updateFileStatus(file, "reading", message);
 
-            onProgress: (status, detail) => {
-              updateFileStatus(file, "reading", status);
+              updateExtractionLoading(
+                message,
 
-              updateExtractionLoading(status, `${file.name} • ${detail || ""}`);
+                `${file.name} • File ${fileIndex + 1} of ${documents.length}`,
+              );
             },
           });
 
-          let fileComplete = 0;
+          totalPageCount += pages.length;
 
-          let filePartial = 0;
+          const sourceTotalPages = pages[0]?.sourceTotalPages ?? pages.length;
 
-          for (const record of records) {
-            if (extractedNow.length >= TEST_EXTRACT_LIMIT) {
-              break;
+          let fileRecordCount = 0;
+
+          let fileReviewCount = 0;
+
+          for (const page of pages) {
+            /*
+              IMPORTANT:
+              use preParsedData.
+
+              This keeps the accurate
+              field-by-field OCR result.
+            */
+            const data =
+              page.preParsedData || extractGenericTextFields(page.text);
+
+            console.debug(
+              `[Tax extraction] Page ${page.pageNumber}`,
+
+              {
+                method: page.method,
+
+                data,
+              },
+            );
+
+            if (!hasUsefulData(data)) {
+              fileReviewCount += 1;
+
+              reviewPageCount += 1;
+
+              continue;
             }
 
             extractedNow.push({
               fileKey,
 
-              pageNumber: record.pageNumber,
+              pageNumber: page.pageNumber,
 
-              data: record.data,
-
-              status: record.status,
+              data,
             });
 
-            if (record.status === "complete") {
-              completeCount += 1;
-
-              fileComplete += 1;
-            } else {
-              partialCount += 1;
-
-              filePartial += 1;
-            }
-
-            updateExtractionLoading(
-              `${extractedNow.length} of ${TEST_EXTRACT_LIMIT} test records`,
-              `${file.name} • Page ${record.pageNumber}`,
-            );
+            fileRecordCount += 1;
           }
 
-          if (fileComplete > 0 && filePartial === 0) {
+          const limitText =
+            sourceTotalPages > pages.length
+              ? ` • testing first ${pages.length} of ${sourceTotalPages} pages`
+              : "";
+
+          if (!fileRecordCount) {
             updateFileStatus(
               file,
-              "extracted",
-              `${fileComplete} complete record${fileComplete === 1 ? "" : "s"}`,
+              "review",
+
+              `No usable records found${limitText}`,
             );
-          } else if (fileComplete > 0 || filePartial > 0) {
+          } else if (fileReviewCount) {
             updateFileStatus(
               file,
               "partial",
-              `${fileComplete} complete • ${filePartial} partial`,
+
+              `${fileRecordCount} extracted • ${fileReviewCount} need review${limitText}`,
             );
           } else {
-            updateFileStatus(file, "review", "No target 2307 data detected");
+            updateFileStatus(
+              file,
+              "extracted",
+
+              `${fileRecordCount} record${
+                fileRecordCount === 1 ? "" : "s"
+              } extracted${limitText}`,
+            );
           }
         } catch (error) {
-          console.error(`Unable to analyze ${file.name}`, error);
+          console.error(
+            `Unable to read ${file.name}`,
 
-          failedCount += 1;
+            error,
+          );
+
+          failedFileCount += 1;
 
           updateFileStatus(
             file,
             "failed",
-            error.message || "Unable to analyze document",
+
+            error?.message || "Unable to read document",
           );
         }
       }
 
-      setExtractedRecords((current) => {
-        const untouched = current.filter(
-          (record) => !processedKeys.has(record.fileKey),
-        );
+      setExtractedRecords((current) => [
+        ...current.filter((record) => !processedKeys.has(record.fileKey)),
 
-        const next = [...untouched, ...extractedNow].slice(
-          0,
-          TEST_EXTRACT_LIMIT,
-        );
-
-        /*
-            Only extracted data is sent.
-          */
-        showExtractedDataInNetwork(next.map((record) => record.data));
-
-        return next;
-      });
+        ...extractedNow,
+      ]);
     } finally {
       if (ocrWorker) {
         try {
           await ocrWorker.terminate();
         } catch (error) {
-          console.warn("OCR cleanup warning:", error);
+          console.warn(
+            "OCR worker termination warning:",
+
+            error,
+          );
         }
       }
 
@@ -1674,9 +2179,12 @@ export default function TaxEntry() {
       await Swal.fire({
         icon: "warning",
 
-        title: "No BIR 2307 data found",
+        title: "No tax records extracted",
 
-        text: "The target areas were scanned but no usable Payee Name, TIN, or payment data was detected.",
+        text:
+          failedFileCount > 0
+            ? `${failedFileCount} file(s) could not be processed. Check the browser console for the exact error.`
+            : "The documents were read, but no supported tax information was detected.",
 
         confirmButtonColor: "#18181b",
       });
@@ -1685,48 +2193,46 @@ export default function TaxEntry() {
     }
 
     await Swal.fire({
-      icon: partialCount || failedCount ? "warning" : "success",
+      icon: reviewPageCount || failedFileCount ? "warning" : "success",
 
-      title: "Extraction completed",
+      title: "Extraction complete",
 
       html: `
-        <div style="
-          font-size:14px;
-          line-height:1.8;
-          color:#52525b;
-        ">
+        <div style="font-size:14px;line-height:1.7;color:#52525b;">
           <div>
             <strong>${extractedNow.length}</strong>
-            record${extractedNow.length === 1 ? "" : "s"} kept
+            record${extractedNow.length === 1 ? "" : "s"} extracted.
           </div>
 
           <div>
-            <strong>${completeCount}</strong>
-            complete
-          </div>
-
-          <div>
-            <strong>${partialCount}</strong>
-            partial
+            <strong>${totalPageCount}</strong>
+            page${totalPageCount === 1 ? "" : "s"} processed.
           </div>
 
           ${
-            failedCount
+            reviewPageCount
               ? `
                 <div>
-                  <strong>${failedCount}</strong>
-                  file failure${failedCount === 1 ? "" : "s"}
+                  <strong>${reviewPageCount}</strong>
+                  page(s) need review.
                 </div>
               `
               : ""
           }
 
-          <div style="
-            margin-top:8px;
-            font-size:12px;
-            color:#71717a;
-          ">
-            Partial rows are preserved instead of being deleted.
+          ${
+            failedFileCount
+              ? `
+                <div>
+                  <strong>${failedFileCount}</strong>
+                  file(s) failed.
+                </div>
+              `
+              : ""
+          }
+
+          <div style="margin-top:8px;font-size:12px;color:#71717a;">
+            Test mode processes a maximum of ${PDF_TEST_PAGE_LIMIT} pages per document.
           </div>
         </div>
       `,
@@ -1736,7 +2242,7 @@ export default function TaxEntry() {
   }
 
   /* =======================================================
-     ADD FILES
+     VALIDATE FILES
      ======================================================= */
 
   function validateAndAddFiles(incomingFiles) {
@@ -1781,13 +2287,11 @@ export default function TaxEntry() {
         continue;
       }
 
-      const nextTotal =
-        nextFiles.reduce(
-          (total, selectedFile) => total + selectedFile.size,
-          0,
-        ) + file.size;
+      const total =
+        nextFiles.reduce((sum, selectedFile) => sum + selectedFile.size, 0) +
+        file.size;
 
-      if (nextTotal > MAX_TOTAL_SIZE) {
+      if (total > MAX_TOTAL_SIZE) {
         rejected.push(`${file.name}: total upload exceeds 100 MB`);
 
         continue;
@@ -1828,6 +2332,7 @@ export default function TaxEntry() {
 
   function handleDrop(event) {
     event.preventDefault();
+
     event.stopPropagation();
 
     setIsDragging(false);
@@ -1856,15 +2361,9 @@ export default function TaxEntry() {
       return next;
     });
 
-    setExtractedRecords((current) => {
-      const next = current.filter((record) => record.fileKey !== fileKey);
-
-      showExtractedDataInNetwork(next.map((record) => record.data));
-
-      return next;
-    });
-
-    setFileError("");
+    setExtractedRecords((current) =>
+      current.filter((record) => record.fileKey !== fileKey),
+    );
   }
 
   function clearFiles() {
@@ -1875,12 +2374,10 @@ export default function TaxEntry() {
     setExtractedRecords([]);
 
     setFileError("");
-
-    showExtractedDataInNetwork([]);
   }
 
   /* =======================================================
-     SAVE EXCEL
+     SAVE UPLOADED EXCEL
      ======================================================= */
 
   async function handleSaveUploadedExcel() {
@@ -1895,11 +2392,11 @@ export default function TaxEntry() {
     }
 
     const confirmation = await Swal.fire({
-      title: "Generate BIR 2307 Excel?",
+      title: "Save extracted records?",
 
-      text: `${extractedRecords.length} extracted record${
+      text: `${extractedRecords.length} tax record${
         extractedRecords.length === 1 ? "" : "s"
-      } will be exported.`,
+      } will be exported into one Excel workbook.`,
 
       icon: "question",
 
@@ -1907,7 +2404,7 @@ export default function TaxEntry() {
 
       reverseButtons: true,
 
-      confirmButtonText: "Generate Excel",
+      confirmButtonText: "Save to Excel",
 
       cancelButtonText: "Cancel",
 
@@ -1920,39 +2417,19 @@ export default function TaxEntry() {
       return;
     }
 
-    void Swal.fire({
-      title: "Generating Excel",
-
-      text: "Preparing extracted BIR 2307 records...",
-
-      allowOutsideClick: false,
-
-      allowEscapeKey: false,
-
-      showConfirmButton: false,
-
-      didOpen: () => {
-        Swal.showLoading();
-      },
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    try {
-      exportRecordsToExcel(extractedRecords);
-    } finally {
-      Swal.close();
-    }
+    exportRecordsToExcel(extractedRecords);
 
     Toast.fire({
       icon: "success",
 
-      title: `${extractedRecords.length} records saved`,
+      title: `${extractedRecords.length} record${
+        extractedRecords.length === 1 ? "" : "s"
+      } saved to Excel`,
     });
   }
 
   /* =======================================================
-     MANUAL
+     MANUAL SUBMIT
      ======================================================= */
 
   async function onManualSubmit(data) {
@@ -1983,6 +2460,8 @@ export default function TaxEntry() {
     const record = {
       fileKey: "manual",
 
+      pageNumber: null,
+
       data: {
         form_type: data.formType,
 
@@ -1992,20 +2471,39 @@ export default function TaxEntry() {
           tin: data.tin,
         },
 
+        withholding_agent: {
+          name: "",
+          tin: "",
+        },
+
+        tax_period: {
+          quarter: data.quarter,
+
+          year: String(data.year.getFullYear()),
+
+          from: "",
+
+          to: "",
+        },
+
         withholding: {
           nature_of_income_payment: "",
 
           atc: "",
 
-          first_month: Number(data.grossSales),
+          income_payment: null,
 
-          second_month: null,
+          tax_rate: null,
 
-          third_month: null,
+          tax_withheld: null,
+        },
 
-          total_income_payment: Number(data.grossSales),
+        amounts: {
+          gross_sales: Number(data.grossSales),
 
-          tax_withheld: Number(data.taxDue),
+          taxable_income: Number(data.taxableIncome),
+
+          tax_due: Number(data.taxDue),
         },
       },
     };
@@ -2054,17 +2552,9 @@ export default function TaxEntry() {
       cancelButtonColor: "#71717a",
     });
 
-    if (!confirmation.isConfirmed) {
-      return;
+    if (confirmation.isConfirmed) {
+      reset(DEFAULT_VALUES);
     }
-
-    reset(DEFAULT_VALUES);
-
-    Toast.fire({
-      icon: "success",
-
-      title: "Form cleared",
-    });
   }
 
   /* =======================================================
@@ -2084,23 +2574,10 @@ export default function TaxEntry() {
           </h1>
 
           <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-600">
-            Enter a record manually or extract BIR Form 2307 records from PDF
-            and Word documents.
+            Enter tax information manually or extract multiple tax records from
+            PDF and Word documents.
           </p>
         </header>
-
-        {/* TEST NOTICE */}
-
-        <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
-          <p className="text-sm font-semibold text-amber-900">
-            BIR 2307 Test Mode
-          </p>
-
-          <p className="mt-1 text-xs leading-5 text-amber-700">
-            Only the first {TEST_EXTRACT_LIMIT} pages are analyzed. OCR only
-            scans Payee TIN, Payee Name and the Part III Payment Table.
-          </p>
-        </div>
 
         {/* MODE */}
 
@@ -2108,32 +2585,31 @@ export default function TaxEntry() {
           <ModeButton
             active={entryMode === "manual"}
             title="Enter Manually"
-            description="Enter one tax record manually."
+            description="Enter one tax record manually and save it to Excel."
             onClick={() => setEntryMode("manual")}
           />
 
           <ModeButton
             active={entryMode === "upload"}
-            title="Upload BIR 2307"
-            description="Targeted extraction for the BIR 2307 layout."
+            title="Upload Documents"
+            description={`Upload PDF or DOCX files. Test mode processes only the first ${PDF_TEST_PAGE_LIMIT} pages.`}
             onClick={() => setEntryMode("upload")}
           />
         </div>
 
-        {uploadMode ? (
-          /* =================================================
-             UPLOAD
-             ================================================= */
+        {/* UPLOAD */}
 
+        {uploadMode ? (
           <section className="overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
             <div className="border-b border-zinc-200 p-5 sm:p-6 md:p-7">
               <h2 className="text-base font-semibold text-zinc-950">
-                Upload BIR 2307 Documents
+                Upload Tax Documents
               </h2>
 
               <p className="mt-1 text-sm leading-5 text-zinc-500">
-                Each PDF page is treated as one possible 2307 record. Partial
-                records are preserved instead of discarded.
+                BIR Form 2307 scans Payee name, Taxpayer TIN, Payor name,
+                Withholding Agent TIN, period, ATC, income payment, and tax
+                withheld separately for better accuracy.
               </p>
             </div>
 
@@ -2147,7 +2623,7 @@ export default function TaxEntry() {
                 className="hidden"
               />
 
-              {/* DROP ZONE */}
+              {/* DROPZONE */}
 
               <div
                 role="button"
@@ -2169,6 +2645,7 @@ export default function TaxEntry() {
                 }}
                 onDragEnter={(event) => {
                   event.preventDefault();
+
                   event.stopPropagation();
 
                   if (!isExtracting) {
@@ -2177,10 +2654,12 @@ export default function TaxEntry() {
                 }}
                 onDragOver={(event) => {
                   event.preventDefault();
+
                   event.stopPropagation();
                 }}
                 onDragLeave={(event) => {
                   event.preventDefault();
+
                   event.stopPropagation();
 
                   setIsDragging(false);
@@ -2227,11 +2706,11 @@ export default function TaxEntry() {
                     <span className="h-8 w-8 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-900" />
 
                     <p className="mt-4 text-sm font-semibold text-zinc-900">
-                      Analyzing BIR 2307...
+                      Extracting documents...
                     </p>
 
                     <p className="mt-1 max-w-md text-xs leading-5 text-zinc-500">
-                      Only the required areas are being scanned.
+                      OCR is reading the BIR fields individually.
                     </p>
                   </>
                 ) : (
@@ -2264,7 +2743,7 @@ export default function TaxEntry() {
 
                       <span>•</span>
 
-                      <span>First {TEST_EXTRACT_LIMIT} pages</span>
+                      <span>First {PDF_TEST_PAGE_LIMIT} pages</span>
                     </div>
                   </>
                 )}
@@ -2273,15 +2752,12 @@ export default function TaxEntry() {
               {/* ERROR */}
 
               {fileError && (
-                <div
-                  role="alert"
-                  className="mt-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm leading-5 text-red-700"
-                >
+                <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm leading-5 text-red-700">
                   {fileError}
                 </div>
               )}
 
-              {/* FILES */}
+              {/* FILE LIST */}
 
               {files.length > 0 && (
                 <div className="mt-5 overflow-hidden rounded-lg border border-zinc-200">
@@ -2302,7 +2778,7 @@ export default function TaxEntry() {
                       type="button"
                       disabled={isExtracting}
                       onClick={clearFiles}
-                      className="w-fit text-sm font-medium text-zinc-500 transition hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="w-fit text-sm font-medium text-zinc-500 transition hover:text-red-600 disabled:opacity-40"
                     >
                       Remove all
                     </button>
@@ -2334,8 +2810,8 @@ export default function TaxEntry() {
                       </p>
 
                       <p className="mt-1 text-xs leading-5 text-zinc-500">
-                        Missing fields no longer cause the entire row to
-                        disappear.
+                        Taxpayer TIN and Withholding Agent TIN are exported as
+                        separate columns.
                       </p>
                     </div>
 
@@ -2344,7 +2820,7 @@ export default function TaxEntry() {
                         type="button"
                         onClick={() => extractDocuments(files)}
                         disabled={isExtracting}
-                        className="inline-flex h-10 items-center justify-center rounded-md border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="inline-flex h-10 items-center justify-center rounded-md border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100 disabled:opacity-50"
                       >
                         Extract Again
                       </button>
@@ -2353,7 +2829,7 @@ export default function TaxEntry() {
                         type="button"
                         onClick={handleSaveUploadedExcel}
                         disabled={isExtracting || extractedRecords.length === 0}
-                        className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-zinc-900 px-5 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-zinc-900 px-5 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:opacity-50"
                       >
                         <ExcelIcon />
                         Save to Excel
@@ -2365,9 +2841,7 @@ export default function TaxEntry() {
             </div>
           </section>
         ) : (
-          /* =================================================
-             MANUAL
-             ================================================= */
+          /* MANUAL */
 
           <form
             noValidate
@@ -2418,7 +2892,6 @@ export default function TaxEntry() {
                   <input
                     id="taxpayerName"
                     type="text"
-                    autoComplete="name"
                     placeholder="Juan Dela Cruz"
                     className={getInputClass(errors.taxpayerName)}
                     {...register("taxpayerName", {
@@ -2433,7 +2906,7 @@ export default function TaxEntry() {
                   id="tin"
                   label="TIN"
                   required
-                  hint="Supports 9, 12 and 14 digit TINs."
+                  hint="Supports 9, 12, or 14 digits."
                   error={errors.tin?.message}
                 >
                   <Controller
@@ -2449,9 +2922,8 @@ export default function TaxEntry() {
                         id="tin"
                         type="text"
                         inputMode="numeric"
-                        autoComplete="off"
-                        maxLength={18}
-                        placeholder="297-944-186-00000"
+                        maxLength={17}
+                        placeholder="123-456-789-00000"
                         name={field.name}
                         ref={field.ref}
                         value={field.value}
@@ -2571,13 +3043,6 @@ export default function TaxEntry() {
                   control={control}
                   error={errors.taxDue?.message}
                 />
-
-                <CurrencyField
-                  name="totalAmountPayable"
-                  label="Total Amount Payable"
-                  control={control}
-                  error={errors.totalAmountPayable?.message}
-                />
               </div>
             </FormSection>
 
@@ -2593,7 +3058,7 @@ export default function TaxEntry() {
                   type="button"
                   onClick={handleClearManual}
                   disabled={isSubmitting}
-                  className="inline-flex h-10 items-center justify-center rounded-md border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="inline-flex h-10 items-center justify-center rounded-md border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100 disabled:opacity-50"
                 >
                   Clear Form
                 </button>
@@ -2601,7 +3066,7 @@ export default function TaxEntry() {
                 <button
                   type="submit"
                   disabled={isSubmitting}
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-zinc-900 px-5 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-zinc-900 px-5 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:opacity-60"
                 >
                   <ExcelIcon />
                   Save to Excel
@@ -2706,7 +3171,7 @@ function Field({ id, label, required, hint, error, children }) {
 }
 
 /* =========================================================
-   CURRENCY
+   CURRENCY FIELD
    ========================================================= */
 
 function CurrencyField({ name, label, control, error }) {
@@ -2784,8 +3249,7 @@ function FileItem({ file, state, disabled, onRemove }) {
         onClick={onRemove}
         disabled={disabled}
         aria-label={`Remove ${file.name}`}
-        title="Remove document"
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-red-50 hover:text-red-600 focus:outline-none focus:ring-2 focus:ring-red-200 disabled:cursor-not-allowed disabled:opacity-30"
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-red-50 hover:text-red-600 disabled:opacity-30"
       >
         <TrashIcon />
       </button>
@@ -2794,7 +3258,7 @@ function FileItem({ file, state, disabled, onRemove }) {
 }
 
 /* =========================================================
-   STATUS
+   FILE STATUS
    ========================================================= */
 
 function FileStatus({ state }) {
@@ -2802,47 +3266,39 @@ function FileStatus({ state }) {
     return null;
   }
 
-  if (state.status === "reading") {
-    return (
-      <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700">
-        Reading
-      </span>
-    );
-  }
+  const styles = {
+    reading: "bg-zinc-100 text-zinc-600",
 
-  if (state.status === "extracted") {
-    return (
-      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
-        Extracted
-      </span>
-    );
-  }
+    extracted: "bg-emerald-50 text-emerald-700",
 
-  if (state.status === "partial") {
-    return (
-      <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
-        Partial
-      </span>
-    );
-  }
+    partial: "bg-amber-50 text-amber-700",
 
-  if (state.status === "review") {
-    return (
-      <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
-        Review
-      </span>
-    );
-  }
+    review: "bg-amber-50 text-amber-700",
 
-  if (state.status === "failed") {
-    return (
-      <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-semibold text-red-700">
-        Failed
-      </span>
-    );
-  }
+    failed: "bg-red-50 text-red-700",
+  };
 
-  return null;
+  const labels = {
+    reading: "Reading",
+
+    extracted: "Extracted",
+
+    partial: "Partial",
+
+    review: "Review",
+
+    failed: "Failed",
+  };
+
+  return (
+    <span
+      className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+        styles[state.status] || styles.reading
+      }`}
+    >
+      {labels[state.status] || state.status}
+    </span>
+  );
 }
 
 /* =========================================================
