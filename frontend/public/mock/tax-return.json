@@ -1,0 +1,17 @@
+{
+  "form_type": "BIR Form 1701Q",
+  "taxpayer": {
+    "tin": "123-456-789-000",
+    "name": "Juan Dela Cruz"
+  },
+  "tax_period": {
+    "quarter": "2nd Quarter",
+    "year": "2026"
+  },
+  "amounts": {
+    "gross_sales": 450000,
+    "taxable_income": 120000,
+    "tax_due": 9600,
+    "total_amount_payable": 9600
+  }
+}
